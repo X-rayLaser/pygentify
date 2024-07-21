@@ -98,7 +98,12 @@ class ActionDispatcher:
         handler = self.action_handlers.get(action_name)
         if not handler:
             if action_name in self.agent.tools:
-                return self.agent.tools[action_name](**arg_dict)
+                try:
+                    return self.agent.tools[action_name](**arg_dict)
+                except TypeError as e:
+                    raise BadToolUseError(*e.args)
+                except Exception:
+                    raise
             raise BadToolUseError(f"Action handler for '{action_name}' not found")
 
         return handler(self.agent, arg_dict)
@@ -110,7 +115,7 @@ class ToolUseFailedError(Exception):
 
 def handle_clarify(agent, arg_dict):
     text = arg_dict["text"]
-    return agent.parent.send_message(text)
+    return agent.parent.ask_question(text)
 
 
 def handle_delegate(agent, arg_dict):
@@ -129,16 +134,13 @@ def handle_failure(agent, arg_dict):
 
 
 class GeneratorWithRetries:
-    def __init__(self, llm, system_message, max_retries=3, max_continue=3):
+    def __init__(self, llm, max_retries=3, max_continue=3):
         self.llm = llm
-        self.system_message = system_message
         self.max_retries = max_retries
         self.max_continue = max_continue
 
-    def __call__(self, messages):
-        text = render_messages_to_string(messages, self.system_message)
-
-        response = self._try_generate(text, self.max_retries)
+    def __call__(self, input_text):
+        response = self._try_generate(input_text, self.max_retries)
         for _ in range(self.max_continue):
             if self.incomplete_response(response):
                 response += self._try_generate(response, self.max_retries)
@@ -148,14 +150,124 @@ class GeneratorWithRetries:
         # todo: implement this
         return False
 
-    def _try_generate(self, text, tries):
+    def _try_generate(self, input_text, tries):
         try:
-            return self.llm(text)
+            return self.llm(input_text)
         except Exception:
             if tries > 0:
-                return self._try_generate(text, tries - 1)
+                return self._try_generate(input_text, tries - 1)
             else:
                 raise
+
+
+class Thread:
+    def __init__(self, system_message):
+        self.system_message = system_message
+        self.messages = []
+
+    def add_message(self, text):
+        self.messages.append(text)
+
+    def append_previous(self, text):
+        self.messages[-1] += text
+
+    def render(self, template):
+        renderer = ChatRendererToString(template)
+        return renderer(self.system_message, self.messages)
+
+
+class BaseResponse:
+    pending_action = "pending_action"
+    solution = "solution"
+    failure = "failure"
+    regular_response = "regular_response"
+
+
+class RegularResponse(BaseResponse):
+    def __init__(self, text):
+        self.text = text
+        self.response_type = "regular_response"
+
+
+class PendingActionResponse(BaseResponse):
+    def __init__(self, pre_tool_text, action, arg_dict):
+        self.pre_tool_text = pre_tool_text
+        self.response_type = "pending_action"
+        self.action = action
+        self.arg_dict = arg_dict
+
+    def render_success(self, result):
+        tool_use_str = render_tool_use_string(self.action, self.arg_dict, result)
+        return self.pre_tool_text + tool_use_str
+
+    def render_error(self, error):
+        tool_use_str = render_tool_use_error(self.action, self.arg_dict, error)
+        return self.pre_tool_text + tool_use_str
+
+
+class SolutionResponse(BaseResponse):
+    def __init__(self, text, arg_dict):
+        self.text = text
+        self.response_type = "solution"
+        self.arg_dict = arg_dict
+
+
+class FailureResponse(BaseException):
+    def __init__(self, text, error_dict):
+        self.text = text
+        self.response_type = "failure"
+        self.error_dict = error_dict
+
+
+class LLMChat:
+    def __init__(self, llm, system_message, prompt, template) -> None:
+        self.thread = Thread(system_message)
+        self.thread.add_message(prompt)
+        self.llm = llm
+        self.template = template
+
+    def ask_question(self, text):
+        self.thread.add_message(text)
+        response = self._generate_completion(self.thread)
+        self.thread.add_message(response)
+        return response
+
+    def continue_thought(self):
+        response = self._generate_completion(self.thread)
+        if response.response_type != "pending_action":
+            self.thread.append_previous(response.text)
+        return response
+
+    def add_action_result(self, response, result):
+        resp_str = response.render_success(result)
+        self.thread.append_previous(resp_str)
+
+    def add_action_error(self, response, error):
+        resp_str = response.render_error(error)
+        self.thread.append_previous(resp_str)
+
+    def _generate_completion(self, thread):
+        thread_text = thread.render(template=self.template)
+        response = self.llm(thread_text)
+
+        try:
+            pre_tool_text, tool_name, arg_dict = self._get_tool_use(response)
+            if tool_name == "done_tool":
+                response = SolutionResponse(pre_tool_text, arg_dict)
+            else:
+                response = PendingActionResponse(pre_tool_text, tool_name, arg_dict)
+        except ToolUseNotFoundError:
+            response = RegularResponse(response)
+        return response
+
+    def _get_tool_use(self, response):
+        try:
+            offset, length, body = find_tool_use(response)
+            tool_name, arg_dict = parse_tool_use(body)
+            pre_tool_text = response[:offset]
+            return pre_tool_text, tool_name, arg_dict
+        except ValueError:
+            raise BadToolUseError
 
 
 @dataclass
@@ -175,56 +287,44 @@ class Agent:
 
     def __call__(self, inputs):
         inputs = dict(inputs)
-
         prompt = json.dumps(inputs)
 
-        self.messages = messages = [prompt]
+        template = default_template
+        chat = LLMChat(self.llm, self.system_message, prompt, template)
+        self.chat = chat
 
+        for _ in range(self.max_rounds):
+            response = chat.continue_thought()
+
+            # todo: allow number of attempts to do syntactically correct tool call
+            # todo: catch error with malformed/incorrect tool usage and include the error text to messages
+
+            if response.response_type == "solution":
+                return self.done_tool(**response.arg_dict)
+
+            if response.response_type == "failure":
+                raise Exception("Giving up")
+
+            if response.response_type == "pending_action":
+                try:
+                    result = self._perform_action(response.action, response.arg_dict)
+                    chat.add_action_result(response, result)
+                except Exception as e:
+                    chat.add_action_error(response, str(e))
+
+        raise TooManyRoundsError('Too many rounds of generation')
+
+    def _perform_action(self, action_name, arg_dict):
         handlers = {
             'clarify': handle_clarify, 
             'delegate': handle_delegate,
             'use_tool': handle_tool_use
         }
         dispatcher = ActionDispatcher(self, handlers)
+        return dispatcher(action_name, arg_dict)
 
-        generator = GeneratorWithRetries(self.llm, self.system_message)
-
-        for _ in range(self.max_rounds):
-            response = generator(messages)
-
-            # todo: allow regular response without tool use syntax
-            # todo: allow number of attempts to do syntactically correct tool call
-            # todo: catch error with malformed/incorrect tool usage and include the error text to messages
-
-            pre_tool_text, tool_name, arg_dict = self._get_tool_use(response)
-
-            if tool_name == "done_tool":
-                return self.done_tool(**arg_dict)
-
-            result = dispatcher(action_name=tool_name, arg_dict=arg_dict)
-            
-            tool_use_with_result = render_tool_use_string(tool_name, arg_dict, result)
-            messages.append(pre_tool_text + tool_use_with_result)
-
-        raise TooManyRoundsError('Too many rounds of generation')
-
-    def _get_tool_use(self, response):
-        try:
-            offset, length, body = find_tool_use(response)
-            tool_name, arg_dict = parse_tool_use(body)
-            pre_tool_text = response[:offset]
-            return pre_tool_text, tool_name, arg_dict
-        except ToolUseNotFoundError as e:
-            raise BadToolUseError(f"Invalid tool use syntax: {e}")
-        except ValueError:
-            raise BadToolUseError
-
-    def send_message(self, text):
-        generator = GeneratorWithRetries(self.llm, self.system_message)
-        self.messages.append(text)
-        response = generator(self.messages)
-        self.messages.append(response)
-        return response
+    def ask_question(self, text):
+        return self.chat.ask_question(text)
 
 
 class TooManyRoundsError(Exception):
