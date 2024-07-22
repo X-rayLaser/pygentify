@@ -3,7 +3,8 @@ from dataclasses import dataclass
 import re
 import json
 from .chat_render import ChatRendererToString, default_template
-
+from .llm_backends import BaseLLM, LlamaCpp, GenerationSpec
+from .tools import *
 
 def find_tool_use(s):
     pattern = r"\<\|tool_use_start\|\>([^<]*)<\|tool_use_end\|>"
@@ -39,16 +40,14 @@ def parse_tool_use(text):
 
 def render_tool_use_string(tool_name, arg_dict, result=None):
     data = {'tool_name': tool_name, 'args': arg_dict}
-    if result:
-        data['result'] = result
-    return json.dumps(data)
+    result = result or ''
+    return f'<|tool_use_start|>{json.dumps(data)}<|tool_use_end|><|result_start|>{result}<|result_end|>'
 
 
 def render_tool_use_error(tool_name, arg_dict, error=None):
     data = {'tool_name': tool_name, 'args': arg_dict}
-    if error:
-        data['error'] = error
-    return json.dumps(data)
+    error = error or ''
+    return f'<|tool_use_start|>{json.dumps(data)}<|tool_use_end|><|error_start|>{error}<|error_end|>'
 
 
 def render_messages_to_string(messages, system_message=''):
@@ -62,20 +61,6 @@ class LLMConfig:
     model: str
     context: int = 1024
     temperature: float = 0.1
-
-
-class BaseLLM:
-    def __call__(self, text):
-        raise NotImplementedError
-
-
-class LlamaCpp(BaseLLM):
-    def __init__(self, origin, config):
-        self.origin = origin
-        self.config = config
-
-    def __call__(self, text):
-        return ""
 
 
 class MockLLM(BaseLLM):
@@ -197,12 +182,10 @@ class PendingActionResponse(BaseResponse):
         self.arg_dict = arg_dict
 
     def render_success(self, result):
-        tool_use_str = render_tool_use_string(self.action, self.arg_dict, result)
-        return self.pre_tool_text + tool_use_str
+        return render_tool_use_string(self.action, self.arg_dict, result)
 
     def render_error(self, error):
-        tool_use_str = render_tool_use_error(self.action, self.arg_dict, error)
-        return self.pre_tool_text + tool_use_str
+        return render_tool_use_error(self.action, self.arg_dict, error)
 
 
 class SolutionResponse(BaseResponse):
@@ -219,10 +202,80 @@ class FailureResponse(BaseException):
         self.error_dict = error_dict
 
 
+class Monologue:
+    def __init__(self, llm, system_message, prompt, template):
+        self.thread = Thread(system_message)
+
+        self.thread.add_message(prompt)
+        self.llm = llm
+        self.template = template
+
+        self.monologue = ""
+
+    def continue_thought(self):
+        try:
+            response = self._generate_completion(self.thread)
+        except InvalidJsonError as e:
+            error = e.args[0]
+            error = f'<|tool_use_error_start|>{error}<|tool_use_error_end|>'
+            pre_tool_text = e.args[1]
+            self.llm.logger(error)
+
+            response = pre_tool_text + ' ' + error
+            self.monologue += response
+            return RegularResponse(response)
+
+        if response.response_type != "pending_action":
+            self.monologue += response.text
+            
+        return response
+
+    def add_action_result(self, response, result):
+        resp_str = response.render_success(result)
+        
+        self.llm.logger(resp_str)
+        self.monologue += response.pre_tool_text + resp_str
+
+    def add_action_error(self, response, error):
+        resp_str = response.render_error(error)
+        self.llm.logger(resp_str)
+        self.monologue += response.pre_tool_text + resp_str
+
+    def _generate_completion(self, thread):
+        thread_text = thread.render(template=self.template) + self.monologue
+        response = self.llm(thread_text)
+
+        try:
+            pre_tool_text, tool_name, arg_dict = self._get_tool_use(response)
+            if tool_name == "done_tool":
+                response = SolutionResponse(pre_tool_text, arg_dict)
+            else:
+                response = PendingActionResponse(pre_tool_text, tool_name, arg_dict)
+        except ToolUseNotFoundError:
+            response = RegularResponse(response)
+        return response
+
+    def _get_tool_use(self, response):
+        offset, length, body = find_tool_use(response)
+        
+        pre_tool_text = response[:offset]
+
+        try:
+            tool_name, arg_dict = parse_tool_use(body)
+            return pre_tool_text, tool_name, arg_dict
+        except ValueError as e:
+            raise InvalidJsonError(e.args[0], pre_tool_text)
+
+
+class InvalidJsonError(Exception):
+    pass
+
+
 class LLMChat:
     def __init__(self, llm, system_message, prompt, template) -> None:
         self.thread = Thread(system_message)
         self.thread.add_message(prompt)
+        #self.thread.add_message("")
         self.llm = llm
         self.template = template
 
@@ -293,8 +346,11 @@ class Agent:
         chat = LLMChat(self.llm, self.system_message, prompt, template)
         self.chat = chat
 
+        monologue = Monologue(self.llm, self.system_message, prompt, template)
+
+
         for _ in range(self.max_rounds):
-            response = chat.continue_thought()
+            response = monologue.continue_thought()
 
             # todo: allow number of attempts to do syntactically correct tool call
             # todo: catch error with malformed/incorrect tool usage and include the error text to messages
@@ -308,9 +364,9 @@ class Agent:
             if response.response_type == "pending_action":
                 try:
                     result = self._perform_action(response.action, response.arg_dict)
-                    chat.add_action_result(response, result)
+                    monologue.add_action_result(response, result)
                 except Exception as e:
-                    chat.add_action_error(response, str(e))
+                    monologue.add_action_error(response, str(e))
 
         raise TooManyRoundsError('Too many rounds of generation')
 

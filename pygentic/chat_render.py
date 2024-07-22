@@ -54,6 +54,7 @@ class ChatRendererToString(ChatRenderer):
             conversation += template.replace('%message', text)
 
         conversation = conversation + self.spec['promptSuffix']
+
         if self.use_bos:
             conversation = self.spec['startOfText'] + conversation
         return conversation

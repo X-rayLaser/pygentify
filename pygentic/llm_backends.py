@@ -19,17 +19,28 @@ class RequestMaker:
 
 
 class BaseLLM:
+    def __init__(self):
+        self.logger = lambda x: x
+
     def __call__(self, text):
         raise NotImplementedError
+
+    def add_logger(self, logger):
+        self.logger = logger
 
 
 class LlamaCpp(BaseLLM):
     def __init__(self, host, port, generation_spec, proxies=None):
+        super().__init__()
         self.generator = LlamaCppGenerator(host, port, generation_spec, proxies)
 
     def __call__(self, input_text):
-        tokens = self.generator(input_text)
-        return "".join(tokens)
+        text = ""
+        for token in self.generator(input_text):
+            text += token
+            self.logger(token)
+
+        return text
 
 
 class LlamaCppGenerator(BaseLLM):
