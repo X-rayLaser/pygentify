@@ -35,12 +35,7 @@ class LlamaCpp(BaseLLM):
         self.generator = LlamaCppGenerator(host, port, generation_spec, proxies)
 
     def __call__(self, input_text):
-        text = ""
-        for token in self.generator(input_text):
-            text += token
-            self.logger(token)
-
-        return text
+        yield from self.generator(input_text)
 
 
 class LlamaCppGenerator(BaseLLM):

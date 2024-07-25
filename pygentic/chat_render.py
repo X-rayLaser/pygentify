@@ -58,4 +58,3 @@ class ChatRendererToString(ChatRenderer):
         if self.use_bos:
             conversation = self.spec['startOfText'] + conversation
         return conversation
-
