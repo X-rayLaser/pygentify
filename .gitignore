@@ -3,3 +3,6 @@ example.py
 prompts/
 venv/
 terminals/
+solve_physics.py
+two_agents_test.py
+*.yml

@@ -3,9 +3,18 @@ import json
 from unittest.mock import Mock
 from pygentic import (
     ToolUseNotFoundError, find_tool_use, parse_tool_use, render_tool_use_string,
-    Agent, MockLLM, BadToolUseError, TooManyRoundsError, ActionDispatcher, 
-    ToolUseFailedError, contains_tool_use, render_tool_use_error, ChatRendererToString
+    Agent, BaseLLM, BadToolUseError, TooManyRoundsError, ActionDispatcher, 
+    ToolUseFailedError, contains_tool_use, render_tool_use_error, ChatRendererToString,
+    ToolDoesNotExistError
 )
+
+
+class MockLLM(BaseLLM):
+    def __init__(self, response):
+        self.response = response
+
+    def __call__(self, text):
+        return self.response
 
 
 class FindToolUseTests(unittest.TestCase):
@@ -170,19 +179,19 @@ class TestAgent(unittest.TestCase):
     def test_invalid_tool_use_syntax(self):
         mock_llm = MockLLM('Invalid tool use syntax')
         agent = Agent(llm=mock_llm, tools={'tool1': lambda: 'result1', 'tool2': lambda: 'result2'}, max_rounds=5)
-        with self.assertRaises(BadToolUseError):
+        with self.assertRaises(TooManyRoundsError):
             agent({'input': ''})
 
     def test_tool_not_found(self):
         mock_llm = MockLLM('<|tool_use_start|>{"tool_name": "non_existent_tool", "args": {}}<|tool_use_end|>')
         agent = Agent(llm=mock_llm, tools={'tool1': lambda: 'result1', 'tool2': lambda: 'result2'}, max_rounds=5)
-        with self.assertRaises(BadToolUseError):
+        with self.assertRaises(TooManyRoundsError):
             agent({'input': ''})
 
     def test_malformed_json(self):
         mock_llm = MockLLM('<|tool_use_start|>{"tool_name": "my_tool", "args": [123<|tool_use_end|>')
         agent = Agent(llm=mock_llm, tools={'tool1': lambda: 'result1', 'tool2': lambda: 'result2'}, max_rounds=5)
-        with self.assertRaises(BadToolUseError):
+        with self.assertRaises(TooManyRoundsError):
             agent({'input': ''})
 
     def test_done_tool_no_args(self):
@@ -241,12 +250,12 @@ class TestAgent(unittest.TestCase):
         self.subagent = Agent(llm=MockLLM('<|tool_use_start|>{"tool_name": "clarify", "args": {"text": "some text"}}<|tool_use_end|>'), 
                               tools={'tool1': lambda: 'result1', 'tool2': lambda: 'result2'}, max_rounds=1)
 
-        self.agent.send_message = Mock()
-        self.agent.send_message.return_value = "response"
+        self.agent.ask_question = Mock()
+        self.agent.ask_question.return_value = "response"
         self.subagent.parent = self.agent
         with self.assertRaises(TooManyRoundsError):
             self.subagent({'input': ''})
-        self.assertEqual(("some text", ), self.agent.send_message.call_args.args)
+        self.assertEqual(("some text", ), self.agent.ask_question.call_args.args)
 
         # todo: test what send_message is doing
 
@@ -267,7 +276,7 @@ class TestActionDispatcher(unittest.TestCase):
 
     def test_call_without_handler(self):
         dispatcher = ActionDispatcher(self.agent, self.action_handlers)
-        with self.assertRaises(BadToolUseError):
+        with self.assertRaises(ToolDoesNotExistError):
             dispatcher('non_existent_action', {})
 
     def test_call_with_tool(self):
@@ -283,7 +292,7 @@ class TestActionDispatcher(unittest.TestCase):
     def test_call_with_non_existing_tool(self):
         self.agent.tools = {'tool': lambda x, y: (x, y)}
         dispatcher = ActionDispatcher(self.agent, self.action_handlers)
-        with self.assertRaises(BadToolUseError):
+        with self.assertRaises(ToolDoesNotExistError):
             dispatcher('non_existent_tool', {'x': 1, 'y': 2})
 
     def test_call_with_failure_action(self):
