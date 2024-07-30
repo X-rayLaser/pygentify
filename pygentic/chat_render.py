@@ -38,11 +38,13 @@ class ChatRendererToString(ChatRenderer):
         system_template = self.spec['systemMessage']
 
         if system_message:
-            conversation += system_template.replace('%message', system_message)
+            conversation += system_template.replace('%message', str(system_message))
 
         for i, msg in enumerate(messages):
             template = questionTemplate if i % 2 == 0 else answerTemplate
-            if hasattr(msg, 'text'):
+            if hasattr(msg, 'sections'):
+                text = str(msg)
+            elif hasattr(msg, 'text'):
                 text = msg.text
             elif 'text' in msg:
                 text = msg['text']

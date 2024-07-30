@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import os
 from .chat_render import ChatRendererToString, default_template
 from .llm_backends import BaseLLM, LlamaCpp, GenerationSpec
 from .tools import *
@@ -39,11 +40,11 @@ class Thread:
         self.system_message = system_message
         self.messages = []
 
-    def add_message(self, text):
-        self.messages.append(text)
+    def add_message(self, msg):
+        self.messages.append(msg)
 
-    def append_previous(self, text):
-        self.messages[-1] += text
+    def append_previous(self, section):
+        self.messages[-1].append(section)
 
     def render(self, template):
         renderer = ChatRendererToString(template)
@@ -51,10 +52,10 @@ class Thread:
 
 
 class Chatbot:
-    def __init__(self, system_message, prompt, completer, template, output_device):
+    def __init__(self, system_message: Message, prompt: Message, completer, template, output_device):
         self.thread = Thread(system_message)
         self.thread.add_message(prompt)
-        self.scratch = ""
+        self.scratch = []
         self.completer = completer
         self.template = template
 
@@ -63,29 +64,35 @@ class Chatbot:
             self.output_device.on_token(token)
         self.completer.on_token = trigger_update
 
-        self.output_device(system_message)
-        self.output_device(prompt)
+        self.output_device(str(system_message))
+        self.output_device(str(prompt))
 
-    def respond(self, input_text):
+    def respond(self, input_text: str):
         self.flush_scratch()
-        self.thread.add_message(input_text)
+
+        msg = Message.text_message(input_text)
+        self.thread.add_message(msg)
         self.output_device(input_text)
         return self.generate_more()
 
     def generate_more(self):
         input_text = self.full_text()
         response = self.completer(input_text)
-        self.scratch += response.text
+
+        # todo: in general, this may not be just text and may need to be parsed into different sections
+        # each having their own modality (e.g. interleaving text with images)
+        section = TextSection(response.text)
+        self.scratch.append(section)
         self.output_device(response.text)
         return response
 
     def full_text(self):
-        return self.thread.render(self.template) + self.scratch
+        return self.thread.render(self.template) + str(Message(self.scratch))
 
     def flush_scratch(self):
         if self.scratch:
-            self.thread.add_message(self.scratch)
-            self.scratch = ""
+            self.thread.add_message(Message(self.scratch))
+            self.scratch = []
 
 
 class OutputDevice:
@@ -104,6 +111,8 @@ class FileOutputDevice(OutputDevice):
 
     def on_token(self, token):
         self.buffer += token
+
+        # todo: save only tokens of text modality
         self.append_file(token)
 
     def __call__(self, new_text):
@@ -118,6 +127,40 @@ class FileOutputDevice(OutputDevice):
     def append_file(self, text):
         with open(self.file_path, 'a') as f:
             f.write(text)
+
+
+@dataclass
+class Message:
+    sections: list
+
+    @classmethod
+    def text_message(cls, text):
+        section = TextSection(text)
+        return cls([section])
+
+    def __str__(self):
+        return ''.join(str(section) for section in self.sections)
+
+
+class Section:
+    def __str__(self):
+        raise NotImplementedError
+
+
+@dataclass
+class TextSection(Section):
+    content: str
+
+    def __str__(self):
+        return self.content
+
+
+@dataclass
+class ImageSection(Section):
+    content: bytes
+
+    def __str__(self):
+        return f'image of {len(self.content)} bytes length'
 
 
 class Agent:
@@ -139,15 +182,16 @@ class Agent:
         self.sub_agents = self.sub_agents or {}
         self.sub_agents[name] = sub_agent
 
-    def __call__(self, inputs):
-        inputs = dict(inputs)
-        prompt = json.dumps(inputs)
+    def __call__(self, inputs, files=None):
+        # todo: allow system message to be mixed modality as well
+        system_message = Message.text_message(self.system_message)
+        prompt = self._prepare_prompt_message(inputs, files)
 
         tool_use_helper = SimpleTagBasedToolUse.create_default()
         completer = ToolAugmentedTextCompleter(self, self.llm, tool_use_helper)
         self.completer = completer
 
-        chatbot = Chatbot(self.system_message, prompt, completer, default_template, self.output_device)
+        chatbot = Chatbot(system_message, prompt, completer, default_template, self.output_device)
         self.chatbot = chatbot
 
         for _ in range(self.max_rounds):
@@ -161,12 +205,53 @@ class Agent:
 
         raise TooManyRoundsError('Too many rounds of generation')
 
+    def _prepare_prompt_message(self, inputs, files):
+        inputs = dict(inputs)
+        files = files or []
+
+        files_content = []
+        for file_entry in files:
+            path = file_entry['path']
+            loader = file_entry.get('loader')
+            if loader == 'directory_loader' and os.path.isdir(path):
+                loader = directory_loader
+            else:
+                loader = plain_text_loader
+
+            sections = loader(path)
+            separator = TextSection(f'\n{path}\n')
+            files_content.append(separator)
+            files_content.extend(sections)
+
+        prompt_text = json.dumps(inputs)
+        prompt_sections = files_content + [TextSection(prompt_text)]
+        return Message(prompt_sections)
+
     def ask_question(self, text):
         response = self.chatbot.respond(text)
         if response.response_type == "failure":
             raise Exception("Giving up")
 
         return response.text
+
+
+def plain_text_loader(path):
+    with open(path) as f:
+        return f.read()
+
+
+def directory_loader(path):
+    if not os.path.isdir(path):
+        raise ValueError(f'Path "{path}" is not a directory')
+
+    sections = []
+    for name in os.listdir(path):
+        file_path = os.path.join(path, name)
+        text = plain_text_loader(path)
+        separator = TextSection(f'\n{file_path}\n')
+        sections.append(separator)
+        sections.append(TextSection(text))
+    return sections
 
 
 class TooManyRoundsError(Exception):

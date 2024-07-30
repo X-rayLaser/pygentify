@@ -100,12 +100,20 @@ def load_yaml_spec(yaml_file_path):
     main_agent = agents.get(main_agent_name)
     if not main_agent:
         raise ValueError(f"Entry point agent named '{main_agent_name}' not found")
-    return main_agent, inputs
+    
+    files = []
+    for file_entry in entrypoint.get('files', []):
+        entry = {}
+        entry['path'] = file_entry['path']
+        if 'loader' in file_entry:
+            entry['loader'] = file_entry['loader']
+        files.append(entry)
+    return main_agent, inputs, files
 
 
 def main(yaml_file_path):
-    main_agent, inputs = load_yaml_spec(yaml_file_path)
-    return main_agent(inputs)
+    main_agent, inputs, files = load_yaml_spec(yaml_file_path)
+    return main_agent(inputs, files)
 
 
 if __name__ == '__main__':
