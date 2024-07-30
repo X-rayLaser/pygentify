@@ -6,3 +6,4 @@ terminals/
 solve_physics.py
 two_agents_test.py
 *.yml
+*.csv

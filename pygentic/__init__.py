@@ -1,11 +1,14 @@
 from __future__ import annotations
 import json
 import os
+import re
 from .chat_render import ChatRendererToString, default_template
 from .llm_backends import BaseLLM, LlamaCpp, GenerationSpec
 from .tools import *
 from .completion import *
 from .tool_calling import *
+from .misc import Message, TextSection
+from .loaders import FileTreeLoader, FileLoadingConfig
 
 
 class GeneratorWithRetries:
@@ -129,40 +132,6 @@ class FileOutputDevice(OutputDevice):
             f.write(text)
 
 
-@dataclass
-class Message:
-    sections: list
-
-    @classmethod
-    def text_message(cls, text):
-        section = TextSection(text)
-        return cls([section])
-
-    def __str__(self):
-        return ''.join(str(section) for section in self.sections)
-
-
-class Section:
-    def __str__(self):
-        raise NotImplementedError
-
-
-@dataclass
-class TextSection(Section):
-    content: str
-
-    def __str__(self):
-        return self.content
-
-
-@dataclass
-class ImageSection(Section):
-    content: bytes
-
-    def __str__(self):
-        return f'image of {len(self.content)} bytes length'
-
-
 class Agent:
     default_done_tool = lambda *args, **kwargs: kwargs
 
@@ -176,6 +145,11 @@ class Agent:
         self.output_device = output_device or OutputDevice()
         self.sub_agents = {}
         self.parent = None
+
+        self.loading_config = FileLoadingConfig.empty_config()
+
+    def set_loading_config(self, config: FileLoadingConfig):
+        self.loading_config = config
 
     def add_subagent(self, name, sub_agent):
         sub_agent.parent = self
@@ -212,15 +186,7 @@ class Agent:
         files_content = []
         for file_entry in files:
             path = file_entry['path']
-            loader = file_entry.get('loader')
-            if loader == 'directory_loader' and os.path.isdir(path):
-                loader = directory_loader
-            else:
-                loader = plain_text_loader
-
-            sections = loader(path)
-            separator = TextSection(f'\n{path}\n')
-            files_content.append(separator)
+            sections = FileTreeLoader(self.loading_config)(path)
             files_content.extend(sections)
 
         prompt_text = json.dumps(inputs)
@@ -233,25 +199,6 @@ class Agent:
             raise Exception("Giving up")
 
         return response.text
-
-
-def plain_text_loader(path):
-    with open(path) as f:
-        return f.read()
-
-
-def directory_loader(path):
-    if not os.path.isdir(path):
-        raise ValueError(f'Path "{path}" is not a directory')
-
-    sections = []
-    for name in os.listdir(path):
-        file_path = os.path.join(path, name)
-        text = plain_text_loader(path)
-        separator = TextSection(f'\n{file_path}\n')
-        sections.append(separator)
-        sections.append(TextSection(text))
-    return sections
 
 
 class TooManyRoundsError(Exception):

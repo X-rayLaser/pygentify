@@ -3,7 +3,7 @@ import os
 import importlib
 import yaml
 from pygentic.llm_backends import GenerationSpec, LlamaCpp
-from pygentic import FileOutputDevice, Agent
+from pygentic import FileOutputDevice, Agent, get_default_loaders, FileLoadingConfig
 
 
 def build_llms(spec):
@@ -71,6 +71,32 @@ def build_agents(spec, llms):
     return agents
 
 
+def get_loading_conf(spec):
+    """Override default loaders by custom ones when provided"""
+    loaders = get_default_loaders()
+
+    loading_section = spec.get("file_loading", {})
+
+    ignore_list = loading_section.get("ignore_list", [])
+    stop_on_error = loading_section.get("stop_on_error", True)
+
+    for extension, loader_str in loading_section.get("loaders", {}).items():
+        try:
+            module = importlib.import_module('pygentic.loaders')
+            
+            loader = getattr(module, loader_str)
+        except AttributeError:
+            parts = loader_str.split('.')
+            loader_name = parts[-1]
+            module_path = '.'.join(parts[:-1])
+            module = importlib.import_module(module_path)
+            loader = getattr(module, loader_name)
+        
+        loaders[extension] = loader
+    
+    return FileLoadingConfig(loaders, ignore_list, stop_on_error)
+
+
 def connect_agents(spec, agents):
     for agent_name, agent_spec in spec.get('agents', {}).items():
         for name, sub_agent_name in agent_spec.get('sub_agents', {}).items():
@@ -82,9 +108,13 @@ def load_yaml_spec(yaml_file_path):
     with open(yaml_file_path, 'r') as f:
         spec = yaml.safe_load(f)
 
+    loading_config = get_loading_conf()
     llms = build_llms(spec)
     agents = build_agents(spec, llms)
     connect_agents(spec, agents)
+
+    for agent in agents:
+        agent.set_loading_config(loading_config)
 
     entrypoint = spec.get('entrypoint')
     if entrypoint is None:

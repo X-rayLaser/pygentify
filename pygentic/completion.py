@@ -155,9 +155,8 @@ class ToolAugmentedTextCompleter:
         except ValueError as e:
             body += '}'
             print("Value error, trying to recover with body:", body)
-            # todo: this is bad, if previous error happened because of wrong arguments, adding } will definitely not help
-            # and will likely result in a cryptic json decode error, therefore we should instead try catch again and 
-            # reraise the original error
+            # todo: even more robust behaviour, auto-correct more errors
+            # todo: consider to use custom recovery strategies for fixing simple cases
             try:
                 return self.tool_use_helper.parse(body)
             except:
