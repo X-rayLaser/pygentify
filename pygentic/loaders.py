@@ -1,6 +1,8 @@
 import re
 import os
 from dataclasses import dataclass
+from pypdf import PdfReader
+
 from .misc import TextSection
 
 
@@ -10,31 +12,51 @@ def get_default_loaders():
     for ext in text_extensions:
         loaders[ext] = PlainTextLoader()
 
+    loaders[".pdf"] = SimplePdfLoader()
     return loaders
 
 
 class FileLoader:
+    start_of_file = '\n{}\n'
+    end_of_file = 'EOF\n'
+
     def __call__(self, path):
+        sections = []
+
+        text = self.process_file(path)
+        sof_section = TextSection(self.start_of_file.format(path))
+        eof_section = TextSection(self.end_of_file.format(path))
+
+        sections.append(sof_section)
+        sections.append(TextSection(text))
+        sections.append(eof_section)
+        return sections
+
+    def process_file(self, path):
         raise NotImplementedError
 
 
 class NullLoader(FileLoader):
-    def __call__(self, path):
+    def process_file(self, path):
         raise LoaderError(f'Cannot find a suitable loader for "{path}"')
 
 
 class PlainTextLoader(FileLoader):
-    def __call__(self, path):
+    def process_file(self, path):
         with open(path) as f:
-            text = f.read()
-        
-        sections = []
-        start_of_file = TextSection(f'\n{path}\n')
-        end_of_file = TextSection(f'EOF\n')
-        sections.append(start_of_file)
-        sections.append(TextSection(text))
-        sections.append(end_of_file)
-        return sections
+            return f.read()
+
+
+class SimplePdfLoader(FileLoader):
+    def process_file(self, path):
+        reader = PdfReader(path)
+        number_of_pages = len(reader.pages)
+        content = ""
+
+        for i in range(number_of_pages):
+            page = reader.pages[i]
+            content += page.extract_text()
+        return content
 
 
 @dataclass
