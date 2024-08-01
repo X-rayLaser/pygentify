@@ -30,18 +30,9 @@ class BaseLLM:
 
 
 class LlamaCpp(BaseLLM):
-    def __init__(self, host, port, generation_spec, proxies=None):
+    def __init__(self, base_url, generation_spec, proxies=None):
         super().__init__()
-        self.generator = LlamaCppGenerator(host, port, generation_spec, proxies)
-
-    def __call__(self, input_text):
-        yield from self.generator(input_text)
-
-
-class LlamaCppGenerator(BaseLLM):
-    def __init__(self, host, port, generation_spec, proxies=None):
-        self.host = host
-        self.port = port
+        self.base_url = base_url
 
         self.generation_spec = generation_spec
         self.proxies = proxies or {}
@@ -49,28 +40,14 @@ class LlamaCppGenerator(BaseLLM):
 
         self.headers = {'Content-Type': 'application/json'}
 
+        self.response_data = {}
+
     def __call__(self, prompt):
         sampling_config = self.generation_spec.sampling_config or {}
 
         clean_llm_settings(sampling_config)
 
-        self.start_llm()
-
         yield from self.stream_response(prompt, sampling_config)
-
-    def start_llm(self):
-        inference_config = self.generation_spec.inference_config or {}
-
-        start_llm_url = f"http://{self.host}:{self.port}/start-llm"
-        data = {
-            'repo_id': inference_config.get('model_repo'),
-            'file_name': inference_config.get('file_name'),
-            'launch_params': inference_config.get('launch_params')
-        }
-
-        resp = self.request_maker.post(start_llm_url, data=json.dumps(data), headers=self.headers)
-        if resp.status_code != 200:
-            raise PrepareModelError("Failed to configure and start model")
 
     def stream_response(self, prompt, sampling_settings):
         stop_word = self.generation_spec.stop_word
@@ -82,13 +59,14 @@ class LlamaCppGenerator(BaseLLM):
 
             should_stop = entry["stop"] and entry["stopping_word"]
             value = stop_word if should_stop else entry["content"]
+            self.response_data = entry
             yield value
 
             if should_stop:
                 break
 
     def start_streaming(self, prompt, sampling_settings, stop_word):
-        url = f"http://{self.host}:{self.port}/completion"
+        url = f"{self.base_url}/completion"
 
         payload = {"prompt": prompt, "stream": True, "stop": [stop_word], "cache_prompt": True}
         payload.update(sampling_settings)
@@ -107,7 +85,6 @@ class LlamaCppGenerator(BaseLLM):
 
 @dataclass
 class GenerationSpec:
-    inference_config: dict
     sampling_config: dict
     stop_word: str = None
 

@@ -5,6 +5,7 @@ from .chat_render import ChatRendererToString, default_template
 from .llm_backends import BaseLLM, LlamaCpp, GenerationSpec
 from .tools import *
 from .completion import *
+from .completion import RunOutOfContextError, ParentOutOfContextError
 from .tool_calling import *
 from .misc import Message, TextSection
 from .loaders import FileTreeLoader, FileLoadingConfig
@@ -193,7 +194,11 @@ class Agent:
         return Message(prompt_sections)
 
     def ask_question(self, text):
-        response = self.chatbot.respond(text)
+        try:
+            response = self.chatbot.respond(text)
+        except RunOutOfContextError as e:
+            raise ParentOutOfContextError(*e.args)
+
         if response.response_type == "failure":
             raise Exception("Giving up")
 

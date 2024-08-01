@@ -6,20 +6,38 @@ from pygentic.llm_backends import GenerationSpec, LlamaCpp
 from pygentic import FileOutputDevice, Agent, get_default_loaders, FileLoadingConfig
 
 
+def build_llamacpp(spec):
+    base_url = spec['base_url']
+    sampling_config = spec['sampling_config']
+    stop_token = spec['stop_token']
+    proxies = spec.get('proxies', None)
+
+    generation_spec = GenerationSpec(sampling_config=sampling_config,
+                                     stop_word=stop_token)
+
+    return LlamaCpp(base_url, generation_spec, proxies=proxies)
+
+
+llm_builders = {
+    'llama.cpp': build_llamacpp
+}
+
+
 def build_llms(spec):
     llms = {}
     for name, llm_spec in spec.get('llms', {}).items():
-        llm_host = llm_spec['host']
-        llm_port = llm_spec['port']
-        inference_config = llm_spec['inference_config']
-        sampling_config = llm_spec['sampling_config']
-        stop_token = llm_spec['stop_token']
-        generation_spec = GenerationSpec(inference_config=inference_config,
-                                         sampling_config=sampling_config,
-                                         stop_word=stop_token)
+        backend = llm_spec.get('backend')
 
-        proxies = llm_spec.get('proxies', None)
-        llms[name] = LlamaCpp(llm_host, llm_port, generation_spec, proxies=proxies)
+        supported_backends = list(llm_builders.keys())
+
+        if not backend:
+            raise ValueError(f'"{backend}" must be provided')
+        if backend not in supported_backends:
+            raise ValueError(f'Backend "{backend}" is not supported yet. '
+                             f'Supported backends are {supported_backends}')
+
+        builder = llm_builders[backend]
+        llms[name] = builder(llm_spec)
 
     return llms
 

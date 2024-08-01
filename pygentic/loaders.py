@@ -7,6 +7,7 @@ from .misc import TextSection
 
 
 def get_default_loaders():
+    # todo: support more extensions
     loaders = {}
     text_extensions = [".txt", ".text", ".py", ".c", ".h", ".cpp", "hpp", ".rb", ".csv"]
     for ext in text_extensions:

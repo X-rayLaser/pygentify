@@ -41,10 +41,19 @@ def handle_clarify(agent, arg_dict):
     return agent.parent.ask_question(text)
 
 
-def handle_delegate(agent, arg_dict):
+def handle_delegate(agent, arg_dict, retries=3):
     name = arg_dict["name"]
     sub_agent_inputs = arg_dict["inputs"]
-    return agent.sub_agents[name](sub_agent_inputs)
+    sub_agent = agent.sub_agents[name]
+    
+    exc = None
+    for _ in range(retries):
+        try:
+            return sub_agent(sub_agent_inputs)
+        except RunOutOfContextError as e:
+            exc = e
+    
+    raise exc
 
 
 def handle_tool_use(agent, arg_dict):
@@ -92,6 +101,10 @@ class ToolAugmentedTextCompleter:
             self.on_token(token)
             raw_response += token
 
+        if hasattr(self.llm, "response_data") and self.llm.response_data.get("truncated"):
+            raise RunOutOfContextError("LLM failed generating response: ran out of context")
+
+        print("response data", self.llm.response_data)
         return self._finalize(raw_response)
 
     def _finalize(self, raw_response):
@@ -123,6 +136,9 @@ class ToolAugmentedTextCompleter:
         try:
             result = self._perform_action(action, arg_dict)
             resp_str = self.tool_use_helper.render_with_success(action, arg_dict, result)
+        except ParentOutOfContextError:
+            # when parent agent runs out of context during clarification, propagate the exception
+            raise
         except Exception as e:
             resp_str = self.tool_use_helper.render_with_error(action, arg_dict, str(e))
 
@@ -161,6 +177,14 @@ class ToolAugmentedTextCompleter:
                 return self.tool_use_helper.parse(body)
             except:
                 raise e
+
+
+class RunOutOfContextError(Exception):
+    pass
+
+
+class ParentOutOfContextError(Exception):
+    pass
 
 
 class ToolDoesNotExistError(Exception):
