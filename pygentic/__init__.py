@@ -1,6 +1,6 @@
 from __future__ import annotations
 import json
-
+import sys
 from .chat_render import ChatRendererToString, default_template
 from .llm_backends import BaseLLM, LlamaCpp, GenerationSpec
 from .tools import *
@@ -9,6 +9,7 @@ from .completion import RunOutOfContextError, ParentOutOfContextError
 from .tool_calling import *
 from .misc import Message, TextSection
 from .loaders import FileTreeLoader, FileLoadingConfig
+from .messenger import TokenArrivedEvent, GenerationCompleteEvent, messenger
 
 
 class GeneratorWithRetries:
@@ -205,5 +206,53 @@ class Agent:
         return response.text
 
 
+class TokenBudget:
+    def __init__(self, quota):
+        self.quota = quota
+        self.n_tokens = 0
+
+    def increment(self, n=1):
+        self.n_tokens += n
+        self._check()
+
+    def _check(self):
+        total = self.n_tokens + self.n_staged
+        if total > self.quota:
+            print(f'Total amount of generated tokens ({total}) has exceeded the quota ({self.quota})')
+            sys.exit()
+
+
+class AgentRunner:
+    def __init__(self, agent, max_eval, max_gen, max_total):
+        self.agent = agent
+        input_budget = TokenBudget(max_eval)
+        output_budget = TokenBudget(max_gen)
+        total_budget = TokenBudget(max_total)
+
+        def on_token(token):
+            output_budget.increment()
+
+        def on_complete(data):
+            _, response_data = data
+            num_eval = response_data["tokens_evaluated"]
+
+            input_budget.increment(num_eval)
+            
+            total = input_budget.n_tokens + output_budget.n_tokens
+            if total > max_total:
+                print(f'Total amount of generated tokens ({total}) has exceeded the quota ({max_total})')
+                sys.exit()
+
+        messenger.subscribe(TokenArrivedEvent.etype, on_token)
+        messenger.subscribe(GenerationCompleteEvent.etype, on_complete)
+
+    def __call__(self, inputs, files=None):
+        return self.agent(inputs, files)
+
+
 class TooManyRoundsError(Exception):
+    pass
+
+
+class BudgetExceededError(Exception):
     pass

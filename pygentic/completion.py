@@ -1,5 +1,6 @@
 from .chat_render import ChatRendererToString, default_template
 from .tool_calling import SimpleTagBasedToolUse
+from .messenger import messenger, TokenArrivedEvent, GenerationCompleteEvent
 
 
 def render_messages_to_string(messages, system_message=''):
@@ -98,8 +99,12 @@ class ToolAugmentedTextCompleter:
         raw_response = ""
 
         for token in self.llm(input_text):
+            messenger.publish(TokenArrivedEvent(token))
             self.on_token(token)
             raw_response += token
+
+        event_data = (raw_response, self.llm.response_data)
+        messenger.publish(GenerationCompleteEvent(event_data))
 
         if hasattr(self.llm, "response_data") and self.llm.response_data.get("truncated"):
             raise RunOutOfContextError("LLM failed generating response: ran out of context")
