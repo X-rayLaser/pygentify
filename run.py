@@ -3,7 +3,9 @@ import os
 import importlib
 import yaml
 from pygentic.llm_backends import GenerationSpec, LlamaCpp
-from pygentic import FileOutputDevice, Agent, get_default_loaders, FileLoadingConfig
+from pygentic import FileOutputDevice, Agent, FileLoadingConfig
+from pygentic import run_agent
+from pygentic.loaders import get_default_loaders
 
 
 def build_llamacpp(spec):
@@ -126,12 +128,12 @@ def load_yaml_spec(yaml_file_path):
     with open(yaml_file_path, 'r') as f:
         spec = yaml.safe_load(f)
 
-    loading_config = get_loading_conf()
+    loading_config = get_loading_conf(spec)
     llms = build_llms(spec)
     agents = build_agents(spec, llms)
     connect_agents(spec, agents)
 
-    for agent in agents:
+    for agent in agents.values():
         agent.set_loading_config(loading_config)
 
     entrypoint = spec.get('entrypoint')
@@ -156,12 +158,18 @@ def load_yaml_spec(yaml_file_path):
         if 'loader' in file_entry:
             entry['loader'] = file_entry['loader']
         files.append(entry)
-    return main_agent, inputs, files
+    
+    budgets = spec.get('budgets', {})
+    
+    budgets_dict = dict(max_eval = budgets.get("max_eval", 90000),
+                        max_gen = budgets.get("max_gen", 90000),
+                        max_total = budgets.get("max_total", 90000))
+    return main_agent, inputs, files, budgets_dict
 
 
 def main(yaml_file_path):
-    main_agent, inputs, files = load_yaml_spec(yaml_file_path)
-    return main_agent(inputs, files)
+    main_agent, inputs, files, budgets_dict = load_yaml_spec(yaml_file_path)
+    return run_agent(main_agent, inputs, files, **budgets_dict)
 
 
 if __name__ == '__main__':

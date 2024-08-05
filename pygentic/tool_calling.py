@@ -72,6 +72,7 @@ class ToolUse:
 @dataclass
 class GenericToolUse(ToolUse):
     test: str
+    call_template: str
     success_template: str
     error_template: str
     syntax_error_template: str = ""
@@ -108,6 +109,11 @@ class GenericToolUse(ToolUse):
 
         return self.error_template.format(body, error)
 
+    def render(self, tool_name, arg_dict):
+        data = {'tool_name': tool_name, 'args': arg_dict}
+        body = json.dumps(data)
+        return self.call_template.format(body)
+
     def render_with_syntax_error(self, body, error):
         error = error or ''
         template = self.syntax_error_template or self.error_template
@@ -124,7 +130,12 @@ class SimpleTagBasedToolUse(GenericToolUse):
             return s
 
         success_template = f'{start_tag}{{}}{end_tag}{result_start_tag}{{}}{result_end_tag}'
+        call_template = f'{start_tag}{{}}{end_tag}'
         error_template = f'{start_tag}{{}}{end_tag}{error_start_tag}{{}}{error_end_tag}'
+
+
+        self.start_tag = start_tag
+        self.end_tag = end_tag
 
         start_tag = escape(start_tag)
         end_tag = escape(end_tag)
@@ -132,7 +143,7 @@ class SimpleTagBasedToolUse(GenericToolUse):
         error_end_tag = escape(error_end_tag)
 
         test = f"{start_tag}([^<]*){end_tag}"
-        super().__init__(test, success_template, error_template)
+        super().__init__(test, call_template, success_template, error_template)
 
     @classmethod
     def create_default(cls):
@@ -142,3 +153,16 @@ class SimpleTagBasedToolUse(GenericToolUse):
                    result_end_tag="<|result_end|>",
                    error_start_tag="<|error_start|>",
                    error_end_tag="<|error_end|>")
+
+    def parse(self, text):
+        try:
+            return super().parse(text)
+        except ValueError as e:
+            text += '}'
+            print("Value error, trying to recover with body:", text)
+            # todo: even more robust behaviour, auto-correct more errors
+            # todo: consider to use custom recovery strategies for fixing simple cases
+            try:
+                return super().parse(text)
+            except:
+                raise e

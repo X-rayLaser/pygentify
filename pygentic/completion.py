@@ -21,7 +21,7 @@ class ActionDispatcher:
         handler = self.action_handlers.get(action_name)
         if not handler:
             if action_name not in self.agent.tools:
-                raise ToolDoesNotExistError(f'Tool "{action_name}" not found')
+                raise ToolDoesNotExistError(f'Tool "{action_name}" not found', action_name)
 
             try:
                 return self.agent.tools[action_name](**arg_dict)
@@ -88,11 +88,9 @@ class SolutionResponse(BaseResponse):
         self.arg_dict = arg_dict
 
 
-class ToolAugmentedTextCompleter:
-    def __init__(self, agent, llm, tool_use_helper=None):
-        self.agent = agent
+class TextCompleter:
+    def __init__(self, llm):
         self.llm = llm
-        self.tool_use_helper = tool_use_helper or SimpleTagBasedToolUse.create_default()
         self.on_token = lambda token: token
 
     def __call__(self, input_text):
@@ -109,79 +107,7 @@ class ToolAugmentedTextCompleter:
         if hasattr(self.llm, "response_data") and self.llm.response_data.get("truncated"):
             raise RunOutOfContextError("LLM failed generating response: ran out of context")
 
-        print("response data", self.llm.response_data)
-        return self._finalize(raw_response)
-
-    def _finalize(self, raw_response):
-        if not self.tool_use_helper.contains_tool_use(raw_response):
-            return RegularResponse(raw_response)
-
-        try:
-            response = self._get_tool_use_response(raw_response)
-        except InvalidJsonError as e:
-            response = self._get_malformed_syntax_response(e)
-        
-        return response
-
-    def _get_malformed_syntax_response(self, exc):
-        error = exc.args[0]
-        pre_tool_text = exc.args[1]
-        body = exc.args[2]
-
-        resp_str = self.tool_use_helper.render_with_syntax_error(body, error)
-        response = pre_tool_text + resp_str
-        return RegularResponse(response)
-
-    def _get_tool_use_response(self, raw_response):
-        pre_tool_text, action, arg_dict = self._get_tool_use(raw_response)
-    
-        if action == "done_tool":
-            return SolutionResponse(pre_tool_text, arg_dict)
-
-        try:
-            result = self._perform_action(action, arg_dict)
-            resp_str = self.tool_use_helper.render_with_success(action, arg_dict, result)
-        except ParentOutOfContextError:
-            # when parent agent runs out of context during clarification, propagate the exception
-            raise
-        except Exception as e:
-            resp_str = self.tool_use_helper.render_with_error(action, arg_dict, str(e))
-
-        return RegularResponse(pre_tool_text + resp_str)
-
-    def _perform_action(self, action_name, arg_dict):
-        handlers = {
-            'clarify': handle_clarify, 
-            'delegate': handle_delegate,
-            'use_tool': handle_tool_use
-        }
-        dispatcher = ActionDispatcher(self.agent, handlers)
-        return dispatcher(action_name, arg_dict)
-
-    def _get_tool_use(self, response):
-        offset, length, body = self.tool_use_helper.find(response)
-        
-        pre_tool_text = response[:offset]
-
-        try:
-            tool_name, arg_dict = self._parse(body)
-            return pre_tool_text, tool_name, arg_dict
-        except ValueError as e:
-            raise InvalidJsonError(e.args[0], pre_tool_text, body)
-
-    def _parse(self, body):
-        try:
-            tool_name, arg_dict = self.tool_use_helper.parse(body)
-            return tool_name, arg_dict
-        except ValueError as e:
-            body += '}'
-            print("Value error, trying to recover with body:", body)
-            # todo: even more robust behaviour, auto-correct more errors
-            # todo: consider to use custom recovery strategies for fixing simple cases
-            try:
-                return self.tool_use_helper.parse(body)
-            except:
-                raise e
+        return raw_response
 
 
 class RunOutOfContextError(Exception):
