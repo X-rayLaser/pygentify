@@ -47,47 +47,56 @@ class Thread:
     def add_message(self, msg):
         self.messages.append(msg)
 
-    def append_previous(self, section):
-        self.messages[-1].append(section)
-
     def render(self, template):
         renderer = ChatRendererToString(template)
         return renderer(self.system_message, self.messages)
 
 
 class ChatHistory:
-    def __init__(self, system_message: Message, prompt: Message, template):
+    def __init__(self, system_message: Message, template):
+        # todo: merge with thread
         self.thread = Thread(system_message)
-        self.thread.add_message(prompt)
-        self.scratch = []
         self.template = template
 
-    def write(self, text):
-        section = TextSection(text)
-        self.scratch.append(section)
+    def add_prompter_message(self, text):
+        assert len(self.thread.messages) % 2 == 0
+        self._add_message()
 
-    def erase_last_section(self):
-        self.scratch.pop()
+    def add_ai_message(self, text):
+        assert len(self.thread.messages) % 2 == 1
+        self._add_message()
 
-    def add_message(self, text):
-        self.flush_scratch()
+    def _add_message(self, text):
         msg = Message.text_message(text)
         self.thread.add_message(msg)
 
     def full_text(self):
-        return self.thread.render(self.template) + str(Message(self.scratch))
-
-    def flush_scratch(self):
-        if self.scratch:
-            self.thread.add_message(Message(self.scratch))
-            self.scratch = []
+        return self.thread.render(self.template)
 
     def clone(self):
-        history = ChatHistory(system_message="", prompt="", template=self.template)
+        history = ChatHistory(system_message="", template=self.template)
         history.thread.messages = self.thread.messages[:]
         history.thread.system_message = self.thread.system_message
-        history.scratch = self.scratch[:]
         return history
+
+
+class Scratchpad:
+    def __init__(self):
+        self.scratch = []
+    
+    def write_back(self, text):
+        self.scratch.append(TextSection(text))
+
+    def flush(self):
+        res = self.to_message()
+        self.scratch = []
+        return res
+    
+    def to_text(self):
+        return str(self.to_message())
+
+    def to_message(self):
+        return Message(self.scratch)
 
 
 class OutputDevice:
@@ -140,6 +149,9 @@ class Agent:
 
         self.loading_config = FileLoadingConfig.empty_config()
 
+        self.history = ChatHistory(system_message, default_template)
+        self.scratch = Scratchpad()
+
     def set_loading_config(self, config: FileLoadingConfig):
         self.loading_config = config
 
@@ -158,19 +170,22 @@ class Agent:
         self.output_device(str(prompt))
 
         tool_use_helper = SimpleTagBasedToolUse.create_default()
-        completer = TextCompleter(self.llm)
-        self.completer = completer
+        self.completer = completer = TextCompleter(self.llm)
 
         completer.on_token = self._stream_to_device(tool_use_helper)
 
-        history = ChatHistory(system_message, prompt, default_template)
-        self.history = history
+        self.history.add_prompter_message(prompt)
 
-        processor = ResponseProcessor(self, tool_use_helper)
+        processor = self._prepare_processor(tool_use_helper)
 
         for _ in range(self.max_rounds):
-            input_text = history.full_text()
+            input_text = self.history.full_text() + self.scratch.to_text()
             response = completer(input_text)
+
+            if not self.tool_use_helper.contains_tool_use(response):
+                self.scratch.write_back(response)
+                self.output_device(response)
+                continue
 
             try:
                 response = processor(response)
@@ -179,9 +194,6 @@ class Agent:
                 done_tool_call = tool_use_helper.render('done_tool', arg_dict)
                 self.output_device(done_tool_call)
                 return result.args[0]
-
-            history.write(response)
-            self.output_device(response)
 
         raise TooManyRoundsError('Too many rounds of generation')
 
@@ -208,6 +220,51 @@ class Agent:
                 idx = buffer.index(tool_use_helper.end_tag)
                 buffer = buffer[idx + len(buffer):]
         return on_token
+
+    def _prepare_processor(self, tool_use_helper):
+        def error_handler(error, pre_tool_text, body, resp_str):
+            response = pre_tool_text + resp_str
+            self.scratch.write_back(response)
+            self.output_device(response)
+
+        def do_before_delegate(pre_tool_text, action, arg_dict):
+            tool_call_syntax = self.tool_use_helper.render(action, arg_dict)
+            self.scratch.write_back(pre_tool_text + tool_call_syntax)
+
+        def do_after_delegate(action_response):
+            response = action_response.pre_tool_text + action_response.response
+            self.scratch.scratch.pop()
+            self.scratch.write_back(response)
+            self.output_device(response)
+
+        def do_before_clarify(pre_tool_text, action, arg_dict):
+            inquiry = arg_dict["text"]
+
+            self.scratch.write_back(pre_tool_text)
+            self.scratch.write_back(inquiry)
+            msg = self.scratch.flush()
+            self.history.add_ai_message(str(msg))
+
+        def do_after_clarify(self, action_response):
+            response = action_response.pre_tool_text + action_response.response
+            self.history.add_prompter_message(action_response.response)
+            self.output_device(response)
+
+        def do_after_tool(self, action_response):
+            self.scratch.write_back(action_response.pre_tool_text + action_response.response)
+            self.output_device(action_response.pre_tool_text + action_response.response)
+
+        # todo: write assistant
+        assistant = None
+
+        processor = ResponseProcessor(self, tool_use_helper, assistant, error_handler)
+
+        processor.subscribe_pre("delegate", do_before_delegate)
+        processor.subscribe_pre("clarify", do_before_clarify)
+        processor.subscribe_post("delegate", do_after_delegate)
+        processor.subscribe_post("clarify", do_after_clarify)
+        processor.subscribe_post("tool_use", do_after_tool)
+        return processor
 
     def ask_question(self, text):
         try:
@@ -244,27 +301,84 @@ class Agent:
         return Message(prompt_sections)
 
 
+class Assistant:
+    def __init__(self, completer, history, scratch):
+        self.completer = completer
+        self.history = history.clone()
+        self.scratch = scratch.clone()
+
+    def ask_question(self, text):
+        msg = self.scratch.flush()
+        # todo: we need to check that scratch is empty
+        self.history.add_ai_message(str(msg))
+        self.history.add_prompter_message(text)
+        input_text = self.history.full_text() + self.scratch.to_text()
+        response = self.completer(input_text)
+        self.history.add_ai_message(response)
+        return response
+
+
 class ResponseProcessor:
-    def __init__(self, agent, tool_helper):
+    def __init__(self, agent, tool_helper, assistant, raw_handler=None, error_handler=None):
         self.agent = agent
         self.tool_use_helper = tool_helper
+        self.assistant = assistant
+        self.pre_handlers = {}
+        self.post_handlers = {}
+
+        self.raw_handler = raw_handler
+        self.error_handler = error_handler
+
+    def subscribe_pre(self, event, handler):
+        self.pre_handlers[event] = handler
+
+    def subscribe_post(self, event, handler):
+        self.post_handlers[event] = handler
 
     def __call__(self, response):
-        action_handler = ActionHandler(self.agent, self.tool_use_helper)
         if not self.tool_use_helper.contains_tool_use(response):
+            if self.raw_handler:
+                self.raw_handler(response)
             return response
 
         try:
-            pre_tool_text, action, arg_dict = self._get_tool_use(response)
+            pre_tool_text, action, arg_dict = self._get_action(response)
         except InvalidJsonError as exc:
             error, pre_tool_text, body = exc.args
             resp_str = self.tool_use_helper.render_with_syntax_error(body, error)
             response = pre_tool_text + resp_str
+
+            if self.error_handler:
+                self.error_handler(error, pre_tool_text, body, resp_str)
         else:
-            response = action_handler(pre_tool_text, action, arg_dict)
+            response = self._perform_action(pre_tool_text, action, arg_dict)
         return response
 
-    def _get_tool_use(self, response):
+    def _perform_action(self, pre_tool_text, action, arg_dict):
+        if action == "done_tool":
+            raise SolutionComplete(arg_dict)
+
+        actors = {
+            "delegate": Delegator(self.agent, self.tool_use_helper),
+            "clarify": Clarifier(self.assistant)
+        }
+
+        actor = actors.get(action, ToolCaller(self.agent, self.tool_use_helper))
+
+        tool_use_action = "tool_use"
+        pre_handler = self.pre_handlers.get(action, self.pre_handlers.get(tool_use_action))
+        post_handler = self.post_handlers.get(action, self.post_handlers.get(tool_use_action))
+
+        if pre_handler:
+            pre_handler(pre_tool_text, action, arg_dict)
+
+        response = actor(pre_tool_text, action, arg_dict)
+
+        if post_handler:
+            post_handler(ActionResponse(response, pre_tool_text, action, arg_dict))
+        return response
+
+    def _get_action(self, response):
         offset, length, body = self.tool_use_helper.find(response)
         
         pre_tool_text = response[:offset]
@@ -280,36 +394,17 @@ class SolutionComplete(Exception):
     pass
 
 
-class ActionHandler:
+class ClarificationResponse:
+    def __init__(self, response):
+        self.response = response
+
+
+class Delegator:
     def __init__(self, agent, tool_use_helper):
         self.agent = agent
         self.tool_use_helper = tool_use_helper
 
     def __call__(self, pre_tool_text, action, arg_dict):
-        if action == "done_tool":
-            raise SolutionComplete(arg_dict)
-
-        if action == "delegate":
-            # todo: this is consfusing
-            tool_call = self.tool_use_helper.render(action, arg_dict)
-            partial_text = pre_tool_text + tool_call
-            self.agent.history.write(partial_text)
-            response = self._handle_delegate(action, arg_dict)
-            response = pre_tool_text + response
-            self.agent.history.erase_last_section()
-        elif action == "clarify":
-            # todo: and this as well
-            text = arg_dict["text"]
-            tool_call = self.tool_use_helper.render(action, arg_dict)
-            response = self.agent.parent.ask_question(text)
-            self.agent.history.write(pre_tool_text)
-            self.agent.history.flush()
-        else:
-            response = pre_tool_text + self._handle_tool_use(action, arg_dict)
-        
-        return response
-
-    def _handle_delegate(self, action, arg_dict):
         try:
             result = self._delegate(arg_dict)
             response = self.tool_use_helper.render_with_success(action, arg_dict, result)
@@ -319,7 +414,41 @@ class ActionHandler:
             response = self.tool_use_helper.render_with_error(action, arg_dict, str(e))
         return response
 
-    def _handle_tool_use(self, tool_name, arg_dict):
+    def _delegate(self, arg_dict, retries=3):
+        name = arg_dict["name"]
+        sub_agent_inputs = arg_dict["inputs"]
+        sub_agent = self.agent.sub_agents[name]
+        self.agent.backup_history()
+        exc = None
+        for _ in range(retries):
+            self.agent.restore_history()
+
+            try:
+                return sub_agent(sub_agent_inputs)
+            except RunOutOfContextError as e:
+                # todo: needs a way to clear conversation between parent and child before retry
+                exc = e
+
+        raise exc
+
+
+class Clarifier:
+    def __init__(self, assistant):
+        self.assistant = assistant
+
+    def __call__(self, pre_tool_text, action, arg_dict):
+        inquiry = arg_dict["text"]
+        return self.assistant.ask_question(inquiry)
+
+
+class ToolCaller:
+    def __init__(self, agent, tool_use_helper):
+        self.agent = agent
+        self.tool_use_helper = tool_use_helper
+
+    def __call__(self, pre_tool_text, action, arg_dict):
+        tool_name = action
+
         try:
             result = self._use_tool(tool_name, arg_dict)
             resp_str = self.tool_use_helper.render_with_success(tool_name, arg_dict, result)
@@ -337,22 +466,13 @@ class ActionHandler:
         except Exception as e:
             raise ToolUseError(f'Calling tool "{tool_name}" resulted in error: {e.args[0]}')
 
-    def _delegate(self, arg_dict, retries=3):
-        name = arg_dict["name"]
-        sub_agent_inputs = arg_dict["inputs"]
-        sub_agent = self.agent.sub_agents[name]
-        self.agent.backup_history()
-        exc = None
-        for _ in range(retries):
-            self.agent.restore_history()
 
-            try:
-                return sub_agent(sub_agent_inputs)
-            except RunOutOfContextError as e:
-                # todo: needs a way to clear conversation between parent and child before retry
-                exc = e
-        
-        raise exc
+@dataclass
+class ActionResponse:
+    response: str
+    pre_tool_text: str
+    action: str
+    arg_dict: dict
 
 
 class UnknownActionError(Exception):

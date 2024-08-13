@@ -1,7 +1,9 @@
 import re
 import json
 from dataclasses import dataclass
+from inspect import signature
 from .chat_render import ChatRendererToString, default_template
+from .jinja_env import env
 
 
 def find_tool_use(s):
@@ -166,3 +168,28 @@ class SimpleTagBasedToolUse(GenericToolUse):
                 return super().parse(text)
             except:
                 raise e
+
+
+tool_registry = {}
+
+
+class ToolRegistrator:
+    def __init__(self, name):
+        self.name = name
+
+    def __call__(self, func):
+        tool_registry[self.name] = func
+        return func
+
+
+def register(name=None):
+    def decorator(func):
+        func_name = name or func.__name__
+        tool_registry[func_name] = func
+        return func
+    
+    return decorator
+
+
+def default_tool_use_backend():
+    return SimpleTagBasedToolUse.create_default()

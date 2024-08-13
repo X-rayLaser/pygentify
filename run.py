@@ -1,11 +1,14 @@
 import argparse
 import os
 import importlib
+from inspect import signature
 import yaml
 from pygentic.llm_backends import GenerationSpec, LlamaCpp
 from pygentic import FileOutputDevice, Agent, FileLoadingConfig
 from pygentic import run_agent
 from pygentic.loaders import get_default_loaders
+from pygentic.tool_calling import SimpleTagBasedToolUse, create_documentation, default_tool_use_backend, tool_registry
+from pygentic.jinja_env import env
 
 
 def build_llamacpp(spec):
@@ -54,8 +57,8 @@ def import_tool(path):
 
 
 def load_tools(agent_spec):
-    tools = agent_spec.get('tools', {})
-    return {tool_name: import_tool(path) for tool_name, path in tools.items()}
+    return agent_spec.get('tools', [])
+    return [{'tool_name': tool['name'], 'func': tool.get('doc')} for tool in tools]
 
 
 def load_prompt(spec):
@@ -68,12 +71,55 @@ def load_prompt(spec):
         return f.read()
 
 
-def build_agents(spec, llms):
+def document_function(name, func, tool_use_helper, func_template):
+    doc_str = func.__doc__ or "Documentation was not provided for the function"
+    sig = signature(func)
+    examples = []
+    if hasattr(func, 'usage_examples'):
+        for arg_dict in func.usage_examples:
+            tool_use_str = tool_use_helper.render(name, arg_dict)
+            examples.append(tool_use_str)
+
+    return func_template.render(name=name, signature=str(sig), doctext=doc_str, usage_examples=examples)
+
+
+def load_doc_file(doc_file):
+    with open(doc_file) as f:
+        return f.read()
+
+
+def create_docs(agent_spec, tool_use_backend):
+    tools = load_tools(agent_spec)
+    func_template = agent_spec.get("func_doc_template", "function_doc.jinja")
+    api_template = agent_spec.get("api_doc_template", "api_doc.jinja")
+
+    chosen_tools = [tool for tool in tools if tool['name'] in tool_registry]
+    func_docs = []
+    for tool in chosen_tools:
+        tool_name = tool['name']
+        func = tool_registry[tool_name]
+        doc_file = tool.get('doc_file')
+        if doc_file and os.path.isfile(doc_file):
+            doc_text = load_doc_file(doc_file)
+        else:
+            doc_text = document_function(tool_name, func, tool_use_backend, func_template)
+        func_docs.append(doc_text)
+
+    template = env.get_template(api_template)
+    return template.render(func_docs=func_docs)
+
+
+def build_agents(spec, llms, tool_use_backend):
     agents = {}
+    
     for agent_name, agent_spec in spec.get('agents', {}).items():
         tools = load_tools(agent_spec)
+        docs = create_docs(agent_spec, tool_use_backend)
+
         #done_tool = agent_spec.get('done_tool')
         system_message = load_prompt(agent_spec)
+        if docs:
+            system_message += docs
         max_rounds = agent_spec.get('max_rounds', 5)
         log_file = agent_spec.get('log_file')
         output_device = FileOutputDevice(log_file) if log_file else None
@@ -130,7 +176,9 @@ def load_yaml_spec(yaml_file_path):
 
     loading_config = get_loading_conf(spec)
     llms = build_llms(spec)
-    agents = build_agents(spec, llms)
+
+    tool_use_backend = default_tool_use_backend()
+    agents = build_agents(spec, llms, tool_use_backend)
     connect_agents(spec, agents)
 
     for agent in agents.values():
@@ -173,6 +221,7 @@ def main(yaml_file_path):
 
 
 if __name__ == '__main__':
+    # todo: dry run to check how complete prompt looks like for agents
     parser = argparse.ArgumentParser(description='Runs agents using the given yaml specification')
     parser.add_argument('yaml_file', help='Path to the yaml file containing agent specifications')
     args = parser.parse_args()
