@@ -52,27 +52,46 @@ class OutputDevice:
 class FileOutputDevice(OutputDevice):
     def __init__(self, file_path):
         self.file_path = file_path
-        self.buffer = ""
-        self.conversation_text = ""
+        self.cache = TextCache()
 
     def on_token(self, token):
-        self.buffer += token
+        self.cache.fill(token)
 
         # todo: save only tokens of text modality
         self.append_file(token)
 
     def __call__(self, new_text):
-        if self.buffer and new_text.startswith(self.buffer):
-            new_text = new_text[len(self.buffer):] + '\n'
-        else:
+        new_text = self.cache(new_text)
+        if new_text:
             new_text += '\n'
-
         self.append_file(new_text)
-        self.buffer = ""
 
     def append_file(self, text):
         with open(self.file_path, 'a') as f:
             f.write(text)
+
+
+class TextCache:
+    def __init__(self):
+        self.buffer = ""
+
+    def fill(self, text):
+        self.buffer += text
+
+    def __call__(self, text):
+        """Returns a suffix of "text" starting with the first character after common prefix"""
+        n = get_common_prefix_length(self.buffer, text)
+        self.buffer = self.buffer[n:]
+        return text[n:]
+
+
+def get_common_prefix_length(s1, s2):
+    count = 0
+    for ch1, ch2 in zip(s1, s2):
+        if ch1 != ch2: break
+        count += 1
+    
+    return count
 
 
 class Agent:

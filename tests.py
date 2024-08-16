@@ -367,5 +367,40 @@ class TestChatRendererToString(unittest.TestCase):
         self.assertEqual(result, expected_result)
 
 
+from pygentic import TextCache
+
+
+class TextCacheTests(unittest.TestCase):
+    def test_shorter_prefix(self):
+        cache = TextCache()
+        cache.fill("hello world")
+        self.assertEqual("", cache("hello "))
+
+    def test_longer_prefix(self):
+        cache = TextCache()
+        cache.fill("hello world")
+        self.assertEqual(" again!", cache("hello world again!"))
+
+    def test_with_diverging_strings(self):
+        cache = TextCache()
+        cache.fill("hello world")
+
+        self.assertEqual("to you too!", cache("hello to you too!"))
+
+    def test_multiple_calls(self):
+        cache = TextCache()
+        cache.fill("hello world again")
+
+        cache("hello ")
+
+        self.assertEqual("", cache("world "))
+        self.assertEqual(" and again", cache("again and again"))
+
+    def test_after_exhaustion(self):
+        cache = TextCache()
+        self.assertEqual("hello", cache("hello"))
+        self.assertEqual("world", cache("world"))
+
+
 if __name__ == '__main__':
     unittest.main()
