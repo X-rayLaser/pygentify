@@ -64,10 +64,19 @@ class ToolUse:
     def parse(self, text):
         raise NotImplementedError
 
-    def render_with_success(self, tool_name, arg_dict, result=None):
+    def render_tool_call(self, tool_name, arg_dict):
         raise NotImplementedError
 
-    def render_with_error(self, tool_name, arg_dict, error=None):
+    def render_raw_tool_call(self, body):
+        raise NotImplementedError
+
+    def render_result(self, tool_name, result):
+        raise NotImplementedError
+
+    def render_error(self, tool_name, error):
+        raise NotImplementedError
+
+    def render_syntax_error(self, error):
         raise NotImplementedError
 
 
@@ -97,29 +106,26 @@ class GenericToolUse(ToolUse):
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON string: {e}")
 
-    def render_with_success(self, tool_name, arg_dict, result=None):
-        data = {'tool_name': tool_name, 'args': arg_dict}
-        result = result or ''
-        body = json.dumps(data)
-
-        return self.success_template.format(body, result)
-
-    def render_with_error(self, tool_name, arg_dict, error=None):
-        data = {'tool_name': tool_name, 'args': arg_dict}
-        error = error or ''
-        body = json.dumps(data)
-
-        return self.error_template.format(body, error)
-
-    def render(self, tool_name, arg_dict):
+    def render_tool_call(self, tool_name, arg_dict):
         data = {'tool_name': tool_name, 'args': arg_dict}
         body = json.dumps(data)
         return self.call_template.format(body)
 
-    def render_with_syntax_error(self, body, error):
-        error = error or ''
-        template = self.syntax_error_template or self.error_template
-        return template.format(body, error)
+    def render_raw_tool_call(self, body):
+        return self.call_template.format(body)
+
+    def render_result(self, tool_name, result):
+        data = {'tool_name': tool_name, 'result': result}
+        body = json.dumps(data)
+        return self.success_template.format(body)
+
+    def render_error(self, tool_name, error):
+        data = {'tool_name': tool_name, 'error': error}
+        body = json.dumps(data)
+        return self.error_template.format(body)
+
+    def render_syntax_error(self, error):
+        return self.syntax_error_template.format(error)
 
 
 class SimpleTagBasedToolUse(GenericToolUse):
@@ -131,10 +137,10 @@ class SimpleTagBasedToolUse(GenericToolUse):
                 s = s.replace(ch, "\\" + ch)
             return s
 
-        success_template = f'{start_tag}{{}}{end_tag}{result_start_tag}{{}}{result_end_tag}'
         call_template = f'{start_tag}{{}}{end_tag}'
-        error_template = f'{start_tag}{{}}{end_tag}{error_start_tag}{{}}{error_end_tag}'
-
+        success_template = f'{result_start_tag}{{}}{result_end_tag}'
+        error_template = f'{error_start_tag}{{}}{error_end_tag}'
+        syntax_error_template = error_template
 
         self.start_tag = start_tag
         self.end_tag = end_tag
@@ -145,7 +151,7 @@ class SimpleTagBasedToolUse(GenericToolUse):
         error_end_tag = escape(error_end_tag)
 
         test = f"{start_tag}([^<]*){end_tag}"
-        super().__init__(test, call_template, success_template, error_template)
+        super().__init__(test, call_template, success_template, error_template, syntax_error_template)
 
     @classmethod
     def create_default(cls):

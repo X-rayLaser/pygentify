@@ -38,27 +38,32 @@ def divide(num1, num2):
 divide.usage_examples = [{"num1": 23, "num2": 12}, {"num1": 23, "num2": 1}, {"num1": 23, "num2": 22}]
 
 
+@register()
 def round(x):
     return round(x)
 
 
+@register()
 def sqrt(number):
     return math.sqrt(number)
 
 
+@register()
 def pow(num1, num2):
     return math.pow(num1, num2)
 
 
+@register()
 def sin(rads):
     return math.sin(rads)
 
 
+@register()
 def cos(rads):
     return math.cos(rads)
 
 
-cos.usage_examples = ["cos(0.2)"]
+cos.usage_examples = [{"rads": 0.2}]
 
 
 class SearchProvider:

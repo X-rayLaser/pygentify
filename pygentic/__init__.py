@@ -1,15 +1,17 @@
 from __future__ import annotations
 import json
 import sys
+import os
 from .chat_render import ChatRendererToString, default_template
 from .llm_backends import BaseLLM, LlamaCpp, GenerationSpec
 from .tools import *
 from .completion import *
 from .completion import RunOutOfContextError, ParentOutOfContextError
 from .tool_calling import *
-from .misc import Message, TextSection
+from .misc import Message, TextSection, ToolCallSection, ResultSection
 from .loaders import FileTreeLoader, FileLoadingConfig
 from .messenger import TokenArrivedEvent, GenerationCompleteEvent, messenger
+from .messages import JinjaChatFactory, collate
 
 
 class GeneratorWithRetries:
@@ -37,66 +39,6 @@ class GeneratorWithRetries:
                 return self._try_generate(input_text, tries - 1)
             else:
                 raise
-
-
-class Thread:
-    def __init__(self, system_message):
-        self.system_message = system_message
-        self.messages = []
-
-    def add_message(self, msg):
-        self.messages.append(msg)
-
-    def render(self, template):
-        renderer = ChatRendererToString(template)
-        return renderer(self.system_message, self.messages)
-
-
-class ChatHistory:
-    def __init__(self, system_message: Message, template):
-        # todo: merge with thread
-        self.thread = Thread(system_message)
-        self.template = template
-
-    def add_prompter_message(self, text):
-        assert len(self.thread.messages) % 2 == 0
-        self._add_message()
-
-    def add_ai_message(self, text):
-        assert len(self.thread.messages) % 2 == 1
-        self._add_message()
-
-    def _add_message(self, text):
-        msg = Message.text_message(text)
-        self.thread.add_message(msg)
-
-    def full_text(self):
-        return self.thread.render(self.template)
-
-    def clone(self):
-        history = ChatHistory(system_message="", template=self.template)
-        history.thread.messages = self.thread.messages[:]
-        history.thread.system_message = self.thread.system_message
-        return history
-
-
-class Scratchpad:
-    def __init__(self):
-        self.scratch = []
-    
-    def write_back(self, text):
-        self.scratch.append(TextSection(text))
-
-    def flush(self):
-        res = self.to_message()
-        self.scratch = []
-        return res
-    
-    def to_text(self):
-        return str(self.to_message())
-
-    def to_message(self):
-        return Message(self.scratch)
 
 
 class OutputDevice:
@@ -137,20 +79,35 @@ class Agent:
     default_done_tool = lambda *args, **kwargs: kwargs
 
     def __init__(self, llm, tools, done_tool=None, system_message="",
-                 max_rounds=5, output_device=None):
+                 max_rounds=5, output_device=None, temp_output_device=None):
         self.llm = llm
         self.tools = tools
         self.done_tool = done_tool or self.default_done_tool
         self.system_message = system_message
         self.max_rounds = max_rounds
         self.output_device = output_device or OutputDevice()
+        self.temp_output_device = temp_output_device or self.create_temp_terminal()
+
         self.sub_agents = {}
         self.parent = None
 
         self.loading_config = FileLoadingConfig.empty_config()
 
-        self.history = ChatHistory(system_message, default_template)
-        self.scratch = Scratchpad()
+        self.history = []
+
+        self.tool_use_helper = SimpleTagBasedToolUse.create_default()
+        self.chat_factory = JinjaChatFactory('llama3', self.tool_use_helper)
+        self.chat_renderer = self.chat_factory.get_chat_renderer()
+
+    def create_temp_terminal(self):
+        if not isinstance(self.output_device, FileOutputDevice):
+            raise Exception("Cannot create FileOutputDevice for temporary terminal")
+
+        dir_path, file_name = os.path.split(self.output_device.file_path)
+        name, ext = os.path.splitext(file_name)
+        new_file_path = os.path.join(dir_path, f'{name}_private.txt')
+
+        return FileOutputDevice(new_file_path)
 
     def set_loading_config(self, config: FileLoadingConfig):
         self.loading_config = config
@@ -163,39 +120,103 @@ class Agent:
     def __call__(self, inputs, files=None):
         # todo: allow system message to be mixed modality as well
         # todo: error counter to allow at most n attempts to call tool and give up
-        system_message = Message.text_message(self.system_message)
+
+        tool_use_helper = self.tool_use_helper
+        system_message = self.chat_factory.create_system_msg(self.system_message)
+
         prompt = self._prepare_prompt_message(inputs, files)
 
-        self.output_device(str(system_message))
-        self.output_device(str(prompt))
+        self.output_device(system_message.content.render())
+        self.output_device(prompt.content.render())
 
-        tool_use_helper = SimpleTagBasedToolUse.create_default()
         self.completer = completer = TextCompleter(self.llm)
 
         completer.on_token = self._stream_to_device(tool_use_helper)
 
-        self.history.add_prompter_message(prompt)
+        self.history.append(system_message)
+        self.history.append(prompt)
 
-        processor = self._prepare_processor(tool_use_helper)
+        blank_count = 0
 
         for _ in range(self.max_rounds):
-            input_text = self.history.full_text() + self.scratch.to_text()
+            input_text = self.chat_renderer(self.history)
             response = completer(input_text)
 
-            if not self.tool_use_helper.contains_tool_use(response):
-                self.scratch.write_back(response)
-                self.output_device(response)
-                continue
+            if self._blank_response(response):
+                blank_count += 1
+
+                print("GOT BLANK")
+
+                if blank_count >= 3:
+                    # when llm keeps generating blank strings, (on behalf of prompter) ask it to continue
+                    msg = self.chat_factory.create_user_msg("Continue, please")
+                    self.history.append(msg)
+                    blank_count = 0
+                    print("Generated 3 blanks!!!")
+                    continue
 
             try:
-                response = processor(response)
+                self._process_response(response)
             except SolutionComplete as result:
                 arg_dict = result.args[0]
-                done_tool_call = tool_use_helper.render('done_tool', arg_dict)
-                self.output_device(done_tool_call)
+                done_tool_call = self.chat_factory.create_tool_call('done_tool', arg_dict)
+                self.output_device(done_tool_call.content.render())
                 return result.args[0]
 
         raise TooManyRoundsError('Too many rounds of generation')
+
+    def _blank_response(self, response):
+        return not response.replace("\n", "").strip()
+
+    def _process_response(self, response):
+        if not self.tool_use_helper.contains_tool_use(response):
+            self._create_and_process_message(self.chat_factory.create_ai_msg, response)
+            return
+
+        offset, length, body = self.tool_use_helper.find(response)
+        pre_tool_text = response[:offset]
+        self._create_and_process_message(self.chat_factory.create_ai_msg, pre_tool_text)
+
+        try:
+            action, arg_dict = self._get_action(body)
+        except InvalidJsonError as exc:
+            error, body = exc.args
+            self._create_and_process_message(self.chat_factory.create_raw_tool_call, body)
+            self._create_and_process_message(self.chat_factory.create_tool_parse_error, error)
+        else:
+            self._create_and_process_message(self.chat_factory.create_tool_call, action, arg_dict)
+            self._perform_action(action, arg_dict)
+
+    def _create_and_process_message(self, create_fn, *args):
+        msg = create_fn(*args)
+        self.history.append(msg)
+        self.output_device(msg.content.render())
+
+    def _get_action(self, body):
+        try:
+            tool_name, arg_dict = self.tool_use_helper.parse(body)
+            return tool_name, arg_dict
+        except ValueError as e:
+            raise InvalidJsonError(e.args[0], body)
+
+    def _perform_action(self, action, arg_dict):
+        if action == "done_tool":
+            raise SolutionComplete(arg_dict)
+
+        if action == "delegate":
+            actor = Delegator(self, self.chat_factory)
+            msg = actor(action, arg_dict)
+        elif action == "clarify":
+            assistant = AiAssistant(self.parent) if self.parent else NullAssistant()
+            text = arg_dict["text"]
+            response = assistant.ask_question(text)
+            msg = self.chat_factory.create_user_msg(response)
+        else:
+            actor = ToolCaller(self, self.chat_factory)
+            msg = actor(action, arg_dict)
+        
+        self.history.append(msg)
+        self.output_device(msg.content.render())
 
     def _stream_to_device(self, tool_use_helper):
         # todo: refactor
@@ -221,70 +242,11 @@ class Agent:
                 buffer = buffer[idx + len(buffer):]
         return on_token
 
-    def _prepare_processor(self, tool_use_helper):
-        def error_handler(error, pre_tool_text, body, resp_str):
-            response = pre_tool_text + resp_str
-            self.scratch.write_back(response)
-            self.output_device(response)
-
-        def do_before_delegate(pre_tool_text, action, arg_dict):
-            tool_call_syntax = self.tool_use_helper.render(action, arg_dict)
-            self.scratch.write_back(pre_tool_text + tool_call_syntax)
-
-        def do_after_delegate(action_response):
-            response = action_response.pre_tool_text + action_response.response
-            self.scratch.scratch.pop()
-            self.scratch.write_back(response)
-            self.output_device(response)
-
-        def do_before_clarify(pre_tool_text, action, arg_dict):
-            inquiry = arg_dict["text"]
-
-            self.scratch.write_back(pre_tool_text)
-            self.scratch.write_back(inquiry)
-            msg = self.scratch.flush()
-            self.history.add_ai_message(str(msg))
-
-        def do_after_clarify(self, action_response):
-            response = action_response.pre_tool_text + action_response.response
-            self.history.add_prompter_message(action_response.response)
-            self.output_device(response)
-
-        def do_after_tool(self, action_response):
-            self.scratch.write_back(action_response.pre_tool_text + action_response.response)
-            self.output_device(action_response.pre_tool_text + action_response.response)
-
-        # todo: write assistant
-        assistant = None
-
-        processor = ResponseProcessor(self, tool_use_helper, assistant, error_handler)
-
-        processor.subscribe_pre("delegate", do_before_delegate)
-        processor.subscribe_pre("clarify", do_before_clarify)
-        processor.subscribe_post("delegate", do_after_delegate)
-        processor.subscribe_post("clarify", do_after_clarify)
-        processor.subscribe_post("tool_use", do_after_tool)
-        return processor
-
-    def ask_question(self, text):
-        try:
-            self.output_device(text)
-            self.history.add_message(text)
-
-            input_text = self.history.full_text()
-            response = self.completer(input_text)
-            self.history.write(response)
-            self.output_device(response)
-        except RunOutOfContextError as e:
-            raise ParentOutOfContextError(*e.args)
-
-        return response
-
     def backup_history(self):
-        self.backup = self.history.clone()
+        self.backup = self.history[:]
 
     def restore_history(self):
-        self.history = self.backup.clone()
+        self.history = self.backup[:]
 
     def _prepare_prompt_message(self, inputs, files):
         inputs = dict(inputs)
@@ -293,126 +255,62 @@ class Agent:
         files_content = []
         for file_entry in files:
             path = file_entry['path']
-            sections = FileTreeLoader(self.loading_config)(path)
+            sections = FileTreeLoader(self.loading_config, self.chat_factory)(path)
             files_content.extend(sections)
 
         prompt_text = json.dumps(inputs)
-        prompt_sections = files_content + [TextSection(prompt_text)]
-        return Message(prompt_sections)
+        messages = files_content + [self.chat_factory.create_user_msg(prompt_text)]
+        return collate(messages)
 
 
-class Assistant:
-    def __init__(self, completer, history, scratch):
-        self.completer = completer
-        self.history = history.clone()
-        self.scratch = scratch.clone()
+class NullAssistant:
+    def ask_question(self, text):
+        raise NotImplementedError
+
+
+class AiAssistant(NullAssistant):
+    def __init__(self, parent_agent):
+        self.completer = parent_agent.completer
+        self.history = parent_agent.history[:]
+        self.output_device =  parent_agent.temp_output_device
+        self.chat_factory = parent_agent.chat_factory
 
     def ask_question(self, text):
-        msg = self.scratch.flush()
-        # todo: we need to check that scratch is empty
-        self.history.add_ai_message(str(msg))
-        self.history.add_prompter_message(text)
-        input_text = self.history.full_text() + self.scratch.to_text()
-        response = self.completer(input_text)
-        self.history.add_ai_message(response)
-        return response
+        msg = self.chat_factory.create_user_msg(text)
+        self.history.append(msg)
+        self.output_device(text)
 
-
-class ResponseProcessor:
-    def __init__(self, agent, tool_helper, assistant, raw_handler=None, error_handler=None):
-        self.agent = agent
-        self.tool_use_helper = tool_helper
-        self.assistant = assistant
-        self.pre_handlers = {}
-        self.post_handlers = {}
-
-        self.raw_handler = raw_handler
-        self.error_handler = error_handler
-
-    def subscribe_pre(self, event, handler):
-        self.pre_handlers[event] = handler
-
-    def subscribe_post(self, event, handler):
-        self.post_handlers[event] = handler
-
-    def __call__(self, response):
-        if not self.tool_use_helper.contains_tool_use(response):
-            if self.raw_handler:
-                self.raw_handler(response)
-            return response
+        input_text = self.chat_factory.get_chat_renderer()(self.history)
 
         try:
-            pre_tool_text, action, arg_dict = self._get_action(response)
-        except InvalidJsonError as exc:
-            error, pre_tool_text, body = exc.args
-            resp_str = self.tool_use_helper.render_with_syntax_error(body, error)
-            response = pre_tool_text + resp_str
+            response = self.completer(input_text)
+        except RunOutOfContextError as e:
+            raise ParentOutOfContextError(*e.args)
 
-            if self.error_handler:
-                self.error_handler(error, pre_tool_text, body, resp_str)
-        else:
-            response = self._perform_action(pre_tool_text, action, arg_dict)
+        msg = self.chat_factory.create_ai_msg(response)
+        self.history.append(msg)
+        self.output_device(response)
         return response
-
-    def _perform_action(self, pre_tool_text, action, arg_dict):
-        if action == "done_tool":
-            raise SolutionComplete(arg_dict)
-
-        actors = {
-            "delegate": Delegator(self.agent, self.tool_use_helper),
-            "clarify": Clarifier(self.assistant)
-        }
-
-        actor = actors.get(action, ToolCaller(self.agent, self.tool_use_helper))
-
-        tool_use_action = "tool_use"
-        pre_handler = self.pre_handlers.get(action, self.pre_handlers.get(tool_use_action))
-        post_handler = self.post_handlers.get(action, self.post_handlers.get(tool_use_action))
-
-        if pre_handler:
-            pre_handler(pre_tool_text, action, arg_dict)
-
-        response = actor(pre_tool_text, action, arg_dict)
-
-        if post_handler:
-            post_handler(ActionResponse(response, pre_tool_text, action, arg_dict))
-        return response
-
-    def _get_action(self, response):
-        offset, length, body = self.tool_use_helper.find(response)
-        
-        pre_tool_text = response[:offset]
-
-        try:
-            tool_name, arg_dict = self.tool_use_helper.parse(body)
-            return pre_tool_text, tool_name, arg_dict
-        except ValueError as e:
-            raise InvalidJsonError(e.args[0], pre_tool_text, body)
 
 
 class SolutionComplete(Exception):
     pass
 
 
-class ClarificationResponse:
-    def __init__(self, response):
-        self.response = response
-
-
 class Delegator:
-    def __init__(self, agent, tool_use_helper):
+    def __init__(self, agent, chat_factory):
         self.agent = agent
-        self.tool_use_helper = tool_use_helper
+        self.chat_factory = chat_factory
 
-    def __call__(self, pre_tool_text, action, arg_dict):
+    def __call__(self, action, arg_dict):
         try:
             result = self._delegate(arg_dict)
-            response = self.tool_use_helper.render_with_success(action, arg_dict, result)
+            msg = self.chat_factory.create_tool_result(action, result)
         except ParentOutOfContextError as e:
             raise RunOutOfContextError(*e.args)
         except RunOutOfContextError as e:
-            response = self.tool_use_helper.render_with_error(action, arg_dict, str(e))
-        return response
+            msg = self.chat_factory.create_tool_error(action, str(e))
+        return msg
 
     def _delegate(self, arg_dict, retries=3):
         name = arg_dict["name"]
@@ -436,25 +334,25 @@ class Clarifier:
     def __init__(self, assistant):
         self.assistant = assistant
 
-    def __call__(self, pre_tool_text, action, arg_dict):
+    def __call__(self, action, arg_dict):
         inquiry = arg_dict["text"]
         return self.assistant.ask_question(inquiry)
 
 
 class ToolCaller:
-    def __init__(self, agent, tool_use_helper):
+    def __init__(self, agent, chat_factory):
         self.agent = agent
-        self.tool_use_helper = tool_use_helper
+        self.chat_factory = chat_factory
 
-    def __call__(self, pre_tool_text, action, arg_dict):
+    def __call__(self, action, arg_dict):
         tool_name = action
 
         try:
             result = self._use_tool(tool_name, arg_dict)
-            resp_str = self.tool_use_helper.render_with_success(tool_name, arg_dict, result)
+            msg = self.chat_factory.create_tool_result(tool_name, result)
         except Exception as e:
-            resp_str = self.tool_use_helper.render_with_error(tool_name, arg_dict, str(e))
-        return resp_str
+            msg = self.chat_factory.create_tool_error(tool_name, str(e))
+        return msg
 
     def _use_tool(self, tool_name, arg_dict):
         if tool_name not in self.agent.tools:
@@ -465,14 +363,6 @@ class ToolCaller:
             raise BadToolUseError(f'Calling tool "{tool_name}" resulted in error: {e.args[0]}')
         except Exception as e:
             raise ToolUseError(f'Calling tool "{tool_name}" resulted in error: {e.args[0]}')
-
-
-@dataclass
-class ActionResponse:
-    response: str
-    pre_tool_text: str
-    action: str
-    arg_dict: dict
 
 
 class UnknownActionError(Exception):

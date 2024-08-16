@@ -6,14 +6,14 @@ from pypdf import PdfReader
 from .misc import TextSection
 
 
-def get_default_loaders():
+def get_default_loaders(message_factory):
     # todo: support more extensions
     loaders = {}
     text_extensions = [".txt", ".text", ".py", ".c", ".h", ".cpp", "hpp", ".rb", ".csv"]
     for ext in text_extensions:
-        loaders[ext] = PlainTextLoader()
+        loaders[ext] = PlainTextLoader(message_factory)
 
-    loaders[".pdf"] = SimplePdfLoader()
+    loaders[".pdf"] = SimplePdfLoader(message_factory)
     return loaders
 
 
@@ -21,17 +21,21 @@ class FileLoader:
     start_of_file = '\n{}\n'
     end_of_file = 'EOF\n'
 
+    def __init__(self, message_factory):
+        self.message_factory = message_factory
+
     def __call__(self, path):
-        sections = []
+        messages = []
 
         text = self.process_file(path)
-        sof_section = TextSection(self.start_of_file.format(path))
-        eof_section = TextSection(self.end_of_file.format(path))
 
-        sections.append(sof_section)
-        sections.append(TextSection(text))
-        sections.append(eof_section)
-        return sections
+        sof_msg = self.message_factory.create_user_msg(self.start_of_file.format(path))
+        eof_msg = self.message_factory.create_user_msg(self.end_of_file.format(path))
+
+        messages.append(sof_msg)
+        messages.append(self.message_factory.create_user_msg(text))
+        messages.append(eof_msg)
+        return messages
 
     def process_file(self, path):
         raise NotImplementedError
@@ -72,8 +76,9 @@ class FileLoadingConfig:
 
 
 class FileTreeLoader:
-    def __init__(self, config: FileLoadingConfig):
+    def __init__(self, config: FileLoadingConfig, message_factory):
         self.config = config
+        self.message_factory = message_factory
 
     def __call__(self, path):
         try:
@@ -92,12 +97,12 @@ class FileTreeLoader:
         sections = []
         if os.path.isfile(path):
             _, extension = os.path.splitext(path)
-            loader = self.config.loaders.get(extension.lower(), NullLoader())
+            loader = self.config.loaders.get(extension.lower(), NullLoader(self.message_factory))
             sections = loader(path)
         else:
             for name in os.listdir(path):
                 sub_path = os.path.join(path, name)
-                loader = FileTreeLoader(self.config)
+                loader = FileTreeLoader(self.config, self.message_factory)
                 sections.extend(loader(sub_path))
 
         return sections

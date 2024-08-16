@@ -7,8 +7,10 @@ from pygentic.llm_backends import GenerationSpec, LlamaCpp
 from pygentic import FileOutputDevice, Agent, FileLoadingConfig
 from pygentic import run_agent
 from pygentic.loaders import get_default_loaders
-from pygentic.tool_calling import SimpleTagBasedToolUse, create_documentation, default_tool_use_backend, tool_registry
+from pygentic.tool_calling import default_tool_use_backend, tool_registry
 from pygentic.jinja_env import env
+from pygentic.messages import JinjaChatFactory
+from pygentic.tool_calling import SimpleTagBasedToolUse
 
 
 def build_llamacpp(spec):
@@ -77,10 +79,11 @@ def document_function(name, func, tool_use_helper, func_template):
     examples = []
     if hasattr(func, 'usage_examples'):
         for arg_dict in func.usage_examples:
-            tool_use_str = tool_use_helper.render(name, arg_dict)
+            tool_use_str = tool_use_helper.render_tool_call(name, arg_dict)
             examples.append(tool_use_str)
 
-    return func_template.render(name=name, signature=str(sig), doctext=doc_str, usage_examples=examples)
+    template = env.get_template(func_template)
+    return template.render(name=name, signature=str(sig), doctext=doc_str, usage_examples=examples)
 
 
 def load_doc_file(doc_file):
@@ -93,12 +96,12 @@ def create_docs(agent_spec, tool_use_backend):
     func_template = agent_spec.get("func_doc_template", "function_doc.jinja")
     api_template = agent_spec.get("api_doc_template", "api_doc.jinja")
 
-    chosen_tools = [tool for tool in tools if tool['name'] in tool_registry]
+    chosen_tools = [tool for tool in tools if tool in tool_registry]
     func_docs = []
     for tool in chosen_tools:
-        tool_name = tool['name']
+        tool_name = tool if isinstance(tool, str) else tool['name']
         func = tool_registry[tool_name]
-        doc_file = tool.get('doc_file')
+        doc_file = tool.get('doc_file') if isinstance(tool, dict) else None
         if doc_file and os.path.isfile(doc_file):
             doc_text = load_doc_file(doc_file)
         else:
@@ -114,6 +117,8 @@ def build_agents(spec, llms, tool_use_backend):
     
     for agent_name, agent_spec in spec.get('agents', {}).items():
         tools = load_tools(agent_spec)
+        chosen_tools = {tool: tool_registry[tool] for tool in tools if tool in tool_registry}
+        print('LOADED TOOLS', tools)
         docs = create_docs(agent_spec, tool_use_backend)
 
         #done_tool = agent_spec.get('done_tool')
@@ -132,14 +137,17 @@ def build_agents(spec, llms, tool_use_backend):
             raise ValueError(f'LLM "{llm_name}" not found in the YAML specification')
         llm = llms[llm_name]
 
-        agent = Agent(llm, tools, system_message=system_message, max_rounds=max_rounds, output_device=output_device)
+        agent = Agent(llm, chosen_tools, system_message=system_message, max_rounds=max_rounds, output_device=output_device)
         agents[agent_name] = agent
     return agents
 
 
 def get_loading_conf(spec):
     """Override default loaders by custom ones when provided"""
-    loaders = get_default_loaders()
+    tool_use = SimpleTagBasedToolUse.create_default()
+
+    message_factory = JinjaChatFactory('llama3', tool_use)
+    loaders = get_default_loaders(message_factory)
 
     loading_section = spec.get("file_loading", {})
 
