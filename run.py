@@ -2,7 +2,7 @@ import argparse
 import os
 import importlib
 from inspect import signature
-import yaml
+from pygentic.misc import load_yaml
 from pygentic.llm_backends import GenerationSpec, LlamaCpp
 from pygentic import FileOutputDevice, Agent, FileLoadingConfig
 from pygentic import run_agent
@@ -179,8 +179,7 @@ def connect_agents(spec, agents):
 
 
 def load_yaml_spec(yaml_file_path):
-    with open(yaml_file_path, 'r') as f:
-        spec = yaml.safe_load(f)
+    spec = load_yaml(yaml_file_path)
 
     loading_config = get_loading_conf(spec)
     llms = build_llms(spec)

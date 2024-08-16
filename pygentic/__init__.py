@@ -295,7 +295,7 @@ class AiAssistant(NullAssistant):
         self.chat_factory = parent_agent.chat_factory
 
     def ask_question(self, text):
-        msg = self.chat_factory.create_user_msg(text)
+        msg = self.chat_factory.create_user_msg(f'Message from an agent who you delegated latest task to: {text}')
         self.history.append(msg)
         self.output_device(text)
 
